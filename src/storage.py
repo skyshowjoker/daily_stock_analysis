@@ -774,6 +774,55 @@ class AlertCooldownRecord(Base):
     )
 
 
+class RagDocument(Base):
+    """Investment knowledge document ingested into the local RAG store."""
+
+    __tablename__ = 'rag_documents'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String(255), nullable=False, index=True)
+    source_type = Column(String(32), nullable=False, default='article', index=True)
+    source_uri = Column(String(1000))
+    author = Column(String(128))
+    published_at = Column(DateTime, index=True)
+    tags = Column(Text)
+    metadata_json = Column(Text)
+    content_hash = Column(String(64), nullable=False, index=True)
+    status = Column(String(16), nullable=False, default='active', index=True)
+    chunk_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_rag_documents_type_created', 'source_type', 'created_at'),
+        Index('ix_rag_documents_hash', 'content_hash'),
+    )
+
+
+class RagChunk(Base):
+    """Searchable chunk generated from one RAG document."""
+
+    __tablename__ = 'rag_chunks'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    document_id = Column(Integer, ForeignKey('rag_documents.id'), nullable=False, index=True)
+    chunk_index = Column(Integer, nullable=False)
+    content = Column(Text, nullable=False)
+    content_hash = Column(String(64), nullable=False, index=True)
+    char_count = Column(Integer, nullable=False, default=0)
+    token_estimate = Column(Integer, nullable=False, default=0)
+    embedding_model = Column(String(128))
+    embedding_dimensions = Column(Integer)
+    embedding_json = Column(Text)
+    metadata_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('document_id', 'chunk_index', name='uix_rag_chunk_document_index'),
+        Index('ix_rag_chunks_document_index', 'document_id', 'chunk_index'),
+    )
+
+
 class _DatabaseManagerMeta(type):
     """Serialize DatabaseManager construction across __new__ and __init__."""
 

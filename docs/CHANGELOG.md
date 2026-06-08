@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] 新增本地投资 RAG 知识库，支持 Web 投喂文章、新闻、书籍摘录和个人偏好，提供 `/api/v1/rag` 文档/检索接口、SQLite FTS5 索引、中文词法兜底召回与 Agent 检索工具。
+- [新功能] 适配 Anthropic Financial Services 研究工作流，新增盈利分析、投资逻辑、催化日历、可比公司分析 skills 与真实能力边界检查工具；付费 MCP 和 Office 插件保持显式未集成状态。
 - [chore] 移除随 issue / PR 验收流程误入库的截图资产，并明确一次性截图证据应保留在 PR 描述、评论、附件或 artifact 中，不作为仓库文件合入。
 - [修复] 综合情报搜索中的机构分析与业绩预期维度改用 180 天 provider 请求窗口，避免默认短新闻窗口漏掉财报、研报等周期性财经材料。
 - [改进] 多股通知报告将市场阶段收敛为总览下方单行 `市场状态`，不再在每只股票摘要下重复展示数据质量和限制详情。
