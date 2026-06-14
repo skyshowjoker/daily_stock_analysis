@@ -18,7 +18,7 @@ from src.config import (
 from src.notification_noise import NOTIFICATION_SEVERITIES
 from src.notification_routing import ROUTABLE_NOTIFICATION_CHANNELS
 
-SCHEMA_VERSION = "2026-05-25"
+SCHEMA_VERSION = "2026-06-12"
 
 _CATEGORY_DEFINITIONS: List[Dict[str, Any]] = [
     {
@@ -3153,6 +3153,108 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             {
                 "label": "完整指南：环境变量完整列表",
                 "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/full-guide.md#环境变量完整列表",
+            },
+        ],
+        "warning_codes": [],
+    },
+    "RAG_EMBEDDING_MODEL": {
+        "title": "RAG Embedding Model",
+        "description": "Embedding model used for semantic knowledge retrieval. Leave empty to keep FTS5 and lexical retrieval only.",
+        "category": "system",
+        "data_type": "string",
+        "ui_control": "text",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": None,
+        "options": [],
+        "validation": {},
+        "display_order": 60,
+        "help_key": "settings.system.RAG_EMBEDDING_MODEL",
+        "examples": [
+            "RAG_EMBEDDING_MODEL=openai/text-embedding-3-small",
+            "RAG_EMBEDDING_MODEL=ollama/bge-m3",
+        ],
+        "docs": [
+            {
+                "label": "投资 RAG 知识库",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/rag-knowledge-base.md",
+            },
+        ],
+        "warning_codes": [],
+    },
+    "RAG_EMBEDDING_BASE_URL": {
+        "title": "RAG Embedding Base URL",
+        "description": "Optional OpenAI-compatible embedding endpoint. Leave empty to use the provider default resolved by LiteLLM.",
+        "category": "system",
+        "data_type": "string",
+        "ui_control": "text",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": None,
+        "options": [],
+        "validation": {},
+        "display_order": 61,
+        "help_key": "settings.system.RAG_EMBEDDING_BASE_URL",
+        "examples": [
+            "RAG_EMBEDDING_BASE_URL=https://api.openai.com/v1",
+        ],
+        "docs": [
+            {
+                "label": "投资 RAG 知识库",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/rag-knowledge-base.md",
+            },
+        ],
+        "warning_codes": ["network_scope"],
+    },
+    "RAG_EMBEDDING_API_KEY": {
+        "title": "RAG Embedding API Key",
+        "description": "Optional credential dedicated to the semantic embedding endpoint.",
+        "category": "system",
+        "data_type": "string",
+        "ui_control": "password",
+        "is_sensitive": True,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": None,
+        "options": [],
+        "validation": {},
+        "display_order": 62,
+        "help_key": "settings.system.RAG_EMBEDDING_API_KEY",
+        "examples": [
+            "RAG_EMBEDDING_API_KEY=sk-***",
+        ],
+        "docs": [
+            {
+                "label": "投资 RAG 知识库",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/rag-knowledge-base.md",
+            },
+        ],
+        "warning_codes": ["sensitive_value"],
+    },
+    "RAG_EMBEDDING_DIMENSIONS": {
+        "title": "RAG Embedding Dimensions",
+        "description": "Optional output dimension override for embedding models that support it. Zero uses the model default.",
+        "category": "system",
+        "data_type": "integer",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "0",
+        "options": [],
+        "validation": {"min": 0, "max": 65536},
+        "display_order": 63,
+        "help_key": "settings.system.RAG_EMBEDDING_DIMENSIONS",
+        "examples": [
+            "RAG_EMBEDDING_DIMENSIONS=0",
+            "RAG_EMBEDDING_DIMENSIONS=1024",
+        ],
+        "docs": [
+            {
+                "label": "投资 RAG 知识库",
+                "href": "https://github.com/ZhuLinsen/daily_stock_analysis/blob/main/docs/rag-knowledge-base.md",
             },
         ],
         "warning_codes": [],

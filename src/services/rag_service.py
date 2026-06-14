@@ -6,14 +6,26 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy import delete, func, or_, select, text
 
+from src.services.document_parser import (
+    MAX_UPLOAD_BYTES,
+    SUPPORTED_EXTENSIONS,
+    ParsedDocument,
+    parse_uploaded_document,
+)
+from src.services.rag_enrichment import RagEnrichment, enrich_rag_document
+from src.services.rag_embedding_service import (
+    RagEmbeddingError,
+    RagEmbeddingService,
+)
 from src.storage import DatabaseManager, RagChunk, RagDocument
 
 logger = logging.getLogger(__name__)
@@ -21,6 +33,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_CHUNK_SIZE = 1200
 _DEFAULT_CHUNK_OVERLAP = 180
 _DEFAULT_TOP_K = 8
+_DEFAULT_SEMANTIC_SCAN_LIMIT = 20_000
 _MAX_CONTENT_CHARS = 1_000_000
 _SOURCE_TYPES = {"article", "news", "book", "note", "preference", "url", "other"}
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_.$%-]+|[\u4e00-\u9fff]")
@@ -32,22 +45,48 @@ class RagIngestResult:
     title: str
     chunk_count: int
     duplicate: bool = False
+    summary: str = ""
+    source_type: str = "other"
+    tags: tuple[str, ...] = ()
+    enrichment_method: str = ""
+    parser: str = ""
+
+
+@dataclass(frozen=True)
+class RagEmbeddingRebuildResult:
+    enabled: bool
+    embedding_model: str
+    updated_chunks: int
+    skipped_chunks: int
+    failed_chunks: int
+    error: str = ""
 
 
 class RagService:
     """RAG document ingestion and retrieval service.
 
-    The first implementation deliberately keeps retrieval local and
-    deterministic: SQLite FTS5/BM25 plus a lexical fallback for Chinese text.
-    Embedding/vector backends can be added later without changing the document
-    and chunk contract.
+    Retrieval combines provider embeddings, SQLite FTS5/BM25 and a lexical
+    fallback for Chinese text. Semantic retrieval is enabled only when an
+    embedding model is explicitly configured.
     """
 
-    def __init__(self, db_manager: Optional[DatabaseManager] = None):
+    def __init__(
+        self,
+        db_manager: Optional[DatabaseManager] = None,
+        embedding_service: Optional[RagEmbeddingService] = None,
+    ):
         self.db = db_manager or DatabaseManager.get_instance()
+        self.embedding_service = embedding_service or RagEmbeddingService()
         self.chunk_size = self._read_int_env("RAG_CHUNK_SIZE", _DEFAULT_CHUNK_SIZE, 300, 4000)
         self.chunk_overlap = self._read_int_env("RAG_CHUNK_OVERLAP", _DEFAULT_CHUNK_OVERLAP, 0, self.chunk_size // 2)
         self.default_top_k = self._read_int_env("RAG_DEFAULT_TOP_K", _DEFAULT_TOP_K, 1, 30)
+        self.semantic_scan_limit = self._read_int_env(
+            "RAG_SEMANTIC_SCAN_LIMIT",
+            _DEFAULT_SEMANTIC_SCAN_LIMIT,
+            100,
+            200_000,
+        )
+        self.max_upload_bytes = MAX_UPLOAD_BYTES
         self._sqlite_available = bool(getattr(self.db, "_is_sqlite_engine", False))
         self._fts_available = self._sqlite_available
         self._ensure_schema_extensions()
@@ -241,10 +280,22 @@ class RagService:
             normalized_source_type = "other"
 
         normalized_tags = self._normalize_tags(tags)
+        normalized_metadata = dict(metadata or {})
         content_hash = self._hash_text(normalized_content)
         chunks = self._chunk_text(normalized_content)
         if not chunks:
             raise ValueError("content produced no chunks")
+
+        existing_payload = self._find_active_document_by_content(normalized_content)
+        if existing_payload is not None and not replace_existing:
+            return self._ingest_result_from_document(existing_payload)
+
+        embedding_vectors = self._try_embed_chunks(
+            title=normalized_title,
+            source_type=normalized_source_type,
+            tags=normalized_tags,
+            chunks=chunks,
+        )
 
         def _write(session):
             existing = session.execute(
@@ -254,11 +305,8 @@ class RagService:
                 ).limit(1)
             ).scalar_one_or_none()
             if existing is not None and not replace_existing:
-                return RagIngestResult(
-                    document_id=existing.id,
-                    title=existing.title,
-                    chunk_count=existing.chunk_count,
-                    duplicate=True,
+                return self._ingest_result_from_document(
+                    self._document_to_dict(existing)
                 )
 
             if existing is not None and replace_existing:
@@ -271,7 +319,7 @@ class RagService:
                 author=str(author or "").strip()[:128],
                 published_at=self._parse_datetime(published_at),
                 tags=",".join(normalized_tags),
-                metadata_json=self._serialize_json(metadata),
+                metadata_json=self._serialize_json(normalized_metadata),
                 content_hash=content_hash,
                 status="active",
                 chunk_count=len(chunks),
@@ -287,6 +335,17 @@ class RagService:
                     content_hash=self._hash_text(chunk),
                     char_count=len(chunk),
                     token_estimate=max(1, len(chunk) // 2),
+                    embedding_model=(
+                        self.embedding_service.model if embedding_vectors else None
+                    ),
+                    embedding_dimensions=(
+                        len(embedding_vectors[index]) if embedding_vectors else None
+                    ),
+                    embedding_json=(
+                        json.dumps(embedding_vectors[index], separators=(",", ":"))
+                        if embedding_vectors
+                        else None
+                    ),
                     metadata_json=self._serialize_json({"overlap_chars": self.chunk_overlap}),
                 )
                 session.add(row)
@@ -298,9 +357,174 @@ class RagService:
                 title=document.title,
                 chunk_count=len(chunks),
                 duplicate=False,
+                summary=str(normalized_metadata.get("summary") or ""),
+                source_type=normalized_source_type,
+                tags=tuple(normalized_tags),
+                enrichment_method=str(normalized_metadata.get("enrichment_method") or ""),
+                parser=str(normalized_metadata.get("parser") or ""),
             )
 
         return self.db._run_write_transaction("rag_ingest_document", _write)
+
+    def _ingest_result_from_document(
+        self,
+        document: Dict[str, Any],
+    ) -> RagIngestResult:
+        metadata = document.get("metadata") or {}
+        return RagIngestResult(
+            document_id=int(document["id"]),
+            title=str(document["title"]),
+            chunk_count=int(document["chunk_count"]),
+            duplicate=True,
+            summary=str(metadata.get("summary") or ""),
+            source_type=str(document.get("source_type") or "other"),
+            tags=tuple(document.get("tags") or []),
+            enrichment_method=str(metadata.get("enrichment_method") or ""),
+            parser=str(metadata.get("parser") or ""),
+        )
+
+    @staticmethod
+    def _embedding_input(
+        *,
+        title: str,
+        source_type: str,
+        tags: Sequence[str],
+        content: str,
+    ) -> str:
+        context = [
+            f"标题：{title}",
+            f"类型：{source_type}",
+        ]
+        if tags:
+            context.append(f"标签：{', '.join(tags)}")
+        context.append(f"正文：{content}")
+        return "\n".join(context)
+
+    def _try_embed_chunks(
+        self,
+        *,
+        title: str,
+        source_type: str,
+        tags: Sequence[str],
+        chunks: Sequence[str],
+    ) -> List[List[float]]:
+        if not self.embedding_service.is_available:
+            return []
+        inputs = [
+            self._embedding_input(
+                title=title,
+                source_type=source_type,
+                tags=tags,
+                content=chunk,
+            )
+            for chunk in chunks
+        ]
+        try:
+            return self.embedding_service.embed_texts(inputs)
+        except RagEmbeddingError as exc:
+            logger.warning(
+                "RAG embedding generation failed; document will use lexical "
+                "retrieval until embeddings are rebuilt: %s",
+                exc,
+            )
+            return []
+
+    def ingest_file(
+        self,
+        *,
+        data: bytes,
+        filename: str,
+        content_type: str = "",
+        llm_adapter: Optional[Any] = None,
+        replace_existing: bool = False,
+    ) -> RagIngestResult:
+        """Parse, enrich and ingest a document without user-supplied metadata."""
+        parsed: ParsedDocument = parse_uploaded_document(
+            data,
+            filename=filename,
+            content_type=content_type,
+        )
+        existing = self._find_active_document_by_content(parsed.content)
+        if existing is not None and not replace_existing:
+            existing_metadata = existing.get("metadata") or {}
+            return RagIngestResult(
+                document_id=int(existing["id"]),
+                title=str(existing["title"]),
+                chunk_count=int(existing["chunk_count"]),
+                duplicate=True,
+                summary=str(existing_metadata.get("summary") or ""),
+                source_type=str(existing.get("source_type") or "other"),
+                tags=tuple(existing.get("tags") or []),
+                enrichment_method=str(existing_metadata.get("enrichment_method") or ""),
+                parser=str(existing_metadata.get("parser") or ""),
+            )
+
+        enrichment: RagEnrichment = enrich_rag_document(
+            title=parsed.title,
+            content=parsed.content,
+            filename=filename,
+            llm_adapter=llm_adapter,
+        )
+        metadata = {
+            **parsed.metadata,
+            "summary": enrichment.summary,
+            "auto_classified": True,
+            "enrichment_method": enrichment.method,
+            "enrichment_model": enrichment.model,
+        }
+        result = self.ingest_document(
+            title=parsed.title,
+            content=parsed.content,
+            source_type=enrichment.source_type,
+            source_uri=f"upload://{parsed.metadata.get('file_name', filename)}",
+            author=parsed.author,
+            published_at=parsed.published_at,
+            tags=enrichment.tags,
+            metadata=metadata,
+            replace_existing=replace_existing,
+        )
+
+        if result.duplicate:
+            existing = self.get_document(result.document_id)
+            if existing is not None:
+                existing_metadata = existing.get("metadata") or {}
+                return RagIngestResult(
+                    document_id=result.document_id,
+                    title=result.title,
+                    chunk_count=result.chunk_count,
+                    duplicate=True,
+                    summary=str(existing_metadata.get("summary") or ""),
+                    source_type=str(existing.get("source_type") or "other"),
+                    tags=tuple(existing.get("tags") or []),
+                    enrichment_method=str(existing_metadata.get("enrichment_method") or ""),
+                    parser=str(existing_metadata.get("parser") or ""),
+                )
+
+        return RagIngestResult(
+            document_id=result.document_id,
+            title=result.title,
+            chunk_count=result.chunk_count,
+            duplicate=result.duplicate,
+            summary=enrichment.summary,
+            source_type=enrichment.source_type,
+            tags=tuple(enrichment.tags),
+            enrichment_method=enrichment.method,
+            parser=parsed.parser,
+        )
+
+    def _find_active_document_by_content(self, content: str) -> Optional[Dict[str, Any]]:
+        normalized_content = self._normalize_text(content)
+        if not normalized_content:
+            return None
+        content_hash = self._hash_text(normalized_content)
+        with self.db.get_session() as session:
+            document = session.execute(
+                select(RagDocument).where(
+                    RagDocument.content_hash == content_hash,
+                    RagDocument.status == "active",
+                ).limit(1)
+            ).scalar_one_or_none()
+            return self._document_to_dict(document) if document is not None else None
 
     def _insert_fts_row(self, session, chunk: RagChunk, document: RagDocument) -> None:
         if not self._fts_available:
@@ -400,13 +624,37 @@ class RagService:
                 .where(RagDocument.status == "active")
                 .group_by(RagDocument.source_type)
             ).all()
+            embedded_chunk_count = int(
+                session.execute(
+                    select(func.count(RagChunk.id))
+                    .join(RagDocument, RagChunk.document_id == RagDocument.id)
+                    .where(
+                        RagDocument.status == "active",
+                        RagChunk.embedding_model == self.embedding_service.model,
+                        RagChunk.embedding_json.is_not(None),
+                    )
+                ).scalar()
+                or 0
+            ) if self.embedding_service.is_available else 0
+            embedding_coverage = (
+                round(embedded_chunk_count * 100.0 / chunk_count, 2)
+                if chunk_count
+                else 0.0
+            )
             return {
                 "document_count": document_count,
                 "chunk_count": chunk_count,
                 "chunk_size": self.chunk_size,
                 "chunk_overlap": self.chunk_overlap,
-                "retrieval_mode": "sqlite_fts5_bm25_lexical" if self._fts_available else "lexical",
+                "retrieval_mode": self._stats_retrieval_mode(),
                 "by_source_type": {row[0]: int(row[1]) for row in by_type_rows},
+                "supported_extensions": list(SUPPORTED_EXTENSIONS),
+                "max_upload_mb": self.max_upload_bytes // (1024 * 1024),
+                "auto_enrichment": True,
+                "semantic_enabled": self.embedding_service.is_available,
+                "embedding_model": self.embedding_service.model,
+                "embedded_chunk_count": embedded_chunk_count,
+                "embedding_coverage_pct": embedding_coverage,
             }
 
     def search(self, query: str, *, top_k: Optional[int] = None, tags: Optional[Sequence[str] | str] = None) -> Dict[str, Any]:
@@ -416,15 +664,129 @@ class RagService:
         effective_top_k = max(1, min(30, int(top_k or self.default_top_k)))
         normalized_tags = self._normalize_tags(tags)
 
-        fts_results = self._search_fts(normalized_query, effective_top_k, normalized_tags)
-        lexical_results = self._search_lexical(normalized_query, effective_top_k, normalized_tags)
-        merged = self._merge_results(fts_results, lexical_results, top_k=effective_top_k)
+        candidate_k = min(90, effective_top_k * 3)
+        semantic_results, semantic_status = self._search_semantic(
+            normalized_query,
+            candidate_k,
+            normalized_tags,
+        )
+        fts_results = self._search_fts(normalized_query, candidate_k, normalized_tags)
+        lexical_results = self._search_lexical(
+            normalized_query,
+            candidate_k,
+            normalized_tags,
+        )
+        merged = self._merge_results(
+            semantic_results,
+            fts_results,
+            lexical_results,
+            top_k=effective_top_k,
+        )
         return {
             "query": normalized_query,
             "top_k": effective_top_k,
             "results": merged,
-            "retrieval_mode": "hybrid_fts_lexical" if self._fts_available else "lexical",
+            "retrieval_mode": self._search_retrieval_mode(semantic_status),
         }
+
+    def _stats_retrieval_mode(self) -> str:
+        base = "fts5_bm25_lexical" if self._fts_available else "lexical"
+        if self.embedding_service.is_available:
+            return f"hybrid_semantic_{base}"
+        return f"sqlite_{base}" if self._fts_available else base
+
+    def _search_retrieval_mode(self, semantic_status: str) -> str:
+        base = "hybrid_fts_lexical" if self._fts_available else "lexical"
+        if semantic_status == "active":
+            return "hybrid_semantic_fts_lexical"
+        if self.embedding_service.is_available:
+            return f"{base}_semantic_fallback"
+        return base
+
+    def _search_semantic(
+        self,
+        query: str,
+        top_k: int,
+        tags: List[str],
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        if not self.embedding_service.is_available:
+            return [], "disabled"
+
+        with self.db.get_session() as session:
+            rows = session.execute(
+                select(RagChunk, RagDocument)
+                .join(RagDocument, RagChunk.document_id == RagDocument.id)
+                .where(
+                    RagDocument.status == "active",
+                    RagChunk.embedding_model == self.embedding_service.model,
+                    RagChunk.embedding_json.is_not(None),
+                )
+                .order_by(RagChunk.id.desc())
+                .limit(self.semantic_scan_limit)
+            ).all()
+
+        candidates = [
+            (chunk, document)
+            for chunk, document in rows
+            if not tags or self._document_matches_tags(document, tags)
+        ]
+        if not candidates:
+            return [], "no_index"
+
+        try:
+            query_vector = self.embedding_service.embed_texts([query])[0]
+        except RagEmbeddingError as exc:
+            logger.warning("RAG semantic query embedding failed: %s", exc)
+            return [], "error"
+
+        scored = []
+        for chunk, document in candidates:
+            vector = self._parse_embedding_vector(
+                chunk.embedding_json,
+                expected_dimensions=len(query_vector),
+            )
+            if not vector:
+                continue
+            score = self._cosine_similarity(query_vector, vector)
+            scored.append((score, chunk, document))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [
+            self._chunk_to_result(
+                chunk,
+                document,
+                score=score,
+                retrieval="semantic",
+            )
+            for score, chunk, document in scored[:top_k]
+        ], "active" if scored else "no_index"
+
+    @staticmethod
+    def _parse_embedding_vector(
+        value: Optional[str],
+        *,
+        expected_dimensions: int,
+    ) -> List[float]:
+        if not value:
+            return []
+        try:
+            parsed = json.loads(value)
+            vector = [float(item) for item in parsed]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        if len(vector) != expected_dimensions:
+            return []
+        if any(not math.isfinite(item) for item in vector):
+            return []
+        return vector
+
+    @staticmethod
+    def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
+        dot_product = sum(a * b for a, b in zip(left, right))
+        left_norm = math.sqrt(sum(value * value for value in left))
+        right_norm = math.sqrt(sum(value * value for value in right))
+        if left_norm <= 0 or right_norm <= 0:
+            return 0.0
+        return dot_product / (left_norm * right_norm)
 
     def _search_fts(self, query: str, top_k: int, tags: List[str]) -> List[Dict[str, Any]]:
         if not self._fts_available:
@@ -531,16 +893,115 @@ class RagService:
 
     def _merge_results(self, *groups: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
         merged: Dict[int, Dict[str, Any]] = {}
+        weights = {"semantic": 1.6, "fts": 0.8, "lexical": 0.4}
         for group in groups:
-            for result in group:
+            for rank, result in enumerate(group, start=1):
                 chunk_id = int(result["chunk_id"])
+                retrieval = str(result["retrieval"])
+                rrf_score = weights.get(retrieval, 1.0) / (60.0 + rank)
                 existing = merged.get(chunk_id)
                 if existing is None:
-                    merged[chunk_id] = result
+                    merged[chunk_id] = {
+                        **result,
+                        "score": rrf_score,
+                        "retrieval": retrieval,
+                        "score_components": {
+                            retrieval: float(result["score"]),
+                        },
+                    }
                     continue
-                existing["retrieval"] = f"{existing['retrieval']}+{result['retrieval']}"
-                existing["score"] = max(float(existing["score"]), float(result["score"]))
+                existing["retrieval"] = f"{existing['retrieval']}+{retrieval}"
+                existing["score"] = float(existing["score"]) + rrf_score
+                existing["score_components"][retrieval] = float(result["score"])
         return sorted(merged.values(), key=lambda item: float(item["score"]), reverse=True)[:top_k]
+
+    def rebuild_embeddings(
+        self,
+        *,
+        document_id: Optional[int] = None,
+        force: bool = False,
+    ) -> RagEmbeddingRebuildResult:
+        if not self.embedding_service.is_available:
+            raise ValueError("RAG_EMBEDDING_MODEL is not configured")
+
+        with self.db.get_session() as session:
+            stmt = (
+                select(RagChunk, RagDocument)
+                .join(RagDocument, RagChunk.document_id == RagDocument.id)
+                .where(RagDocument.status == "active")
+                .order_by(RagChunk.id.asc())
+            )
+            if document_id is not None:
+                stmt = stmt.where(RagDocument.id == document_id)
+            rows = session.execute(stmt).all()
+
+        targets = []
+        skipped = 0
+        configured_dimensions = int(
+            getattr(self.embedding_service, "dimensions", 0) or 0
+        )
+        for chunk, document in rows:
+            is_current = (
+                chunk.embedding_model == self.embedding_service.model
+                and bool(chunk.embedding_json)
+                and (
+                    configured_dimensions == 0
+                    or chunk.embedding_dimensions == configured_dimensions
+                )
+            )
+            if is_current and not force:
+                skipped += 1
+                continue
+            targets.append((chunk.id, chunk.content, document))
+
+        updated = 0
+        failed = 0
+        last_error = ""
+        batch_size = self.embedding_service.batch_size
+        for start in range(0, len(targets), batch_size):
+            batch = targets[start:start + batch_size]
+            inputs = [
+                self._embedding_input(
+                    title=document.title,
+                    source_type=document.source_type,
+                    tags=self._normalize_tags(document.tags),
+                    content=content,
+                )
+                for _, content, document in batch
+            ]
+            try:
+                vectors = self.embedding_service.embed_texts(inputs)
+            except RagEmbeddingError as exc:
+                failed += len(batch)
+                last_error = str(exc)
+                logger.error("RAG embedding rebuild batch failed: %s", exc)
+                continue
+
+            def _write(session):
+                batch_updated = 0
+                for (chunk_id, _, _), vector in zip(batch, vectors):
+                    chunk = session.get(RagChunk, chunk_id)
+                    if chunk is None:
+                        continue
+                    chunk.embedding_model = self.embedding_service.model
+                    chunk.embedding_dimensions = len(vector)
+                    chunk.embedding_json = json.dumps(vector, separators=(",", ":"))
+                    batch_updated += 1
+                return batch_updated
+
+            updated += self.db._run_write_transaction(
+                "rag_rebuild_embeddings",
+                _write,
+            )
+
+        return RagEmbeddingRebuildResult(
+            enabled=True,
+            embedding_model=self.embedding_service.model,
+            updated_chunks=updated,
+            skipped_chunks=skipped,
+            failed_chunks=failed,
+            error=last_error,
+        )
 
     @staticmethod
     def _document_matches_tags(document: RagDocument, tags: List[str]) -> bool:
@@ -548,6 +1009,7 @@ class RagService:
         return all(tag in doc_tags for tag in tags)
 
     def _document_to_dict(self, document: RagDocument) -> Dict[str, Any]:
+        metadata = self._parse_json(document.metadata_json)
         return {
             "id": document.id,
             "title": document.title,
@@ -556,7 +1018,8 @@ class RagService:
             "author": document.author or "",
             "published_at": document.published_at.isoformat() if document.published_at else None,
             "tags": self._normalize_tags(document.tags),
-            "metadata": self._parse_json(document.metadata_json),
+            "summary": str(metadata.get("summary") or ""),
+            "metadata": metadata,
             "content_hash": document.content_hash,
             "status": document.status,
             "chunk_count": document.chunk_count,

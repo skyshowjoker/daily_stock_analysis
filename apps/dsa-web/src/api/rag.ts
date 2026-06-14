@@ -7,6 +7,8 @@ import type {
   RagDocumentDetail,
   RagDocumentListQuery,
   RagDocumentListResponse,
+  RagEmbeddingRebuildRequest,
+  RagEmbeddingRebuildResponse,
   RagSearchRequest,
   RagSearchResponse,
   RagStatsResponse,
@@ -43,7 +45,31 @@ function toSearchPayload(payload: RagSearchRequest): Record<string, unknown> {
   };
 }
 
+function toEmbeddingRebuildPayload(
+  payload: RagEmbeddingRebuildRequest = {},
+): Record<string, unknown> {
+  return {
+    document_id: payload.documentId,
+    force: payload.force ?? false,
+  };
+}
+
 export const ragApi = {
+  async uploadDocument(file: File): Promise<RagDocumentCreateResponse> {
+    const formData = new FormData();
+    formData.append('file', file);
+    const headers: { [key: string]: string | undefined } = { 'Content-Type': undefined };
+    const response = await apiClient.post<Record<string, unknown>>(
+      '/api/v1/rag/documents/upload',
+      formData,
+      {
+        headers,
+        timeout: 120000,
+      },
+    );
+    return toCamelCase<RagDocumentCreateResponse>(response.data);
+  },
+
   async createDocument(payload: RagDocumentCreateRequest): Promise<RagDocumentCreateResponse> {
     const response = await apiClient.post<Record<string, unknown>>('/api/v1/rag/documents', toDocumentPayload(payload));
     return toCamelCase<RagDocumentCreateResponse>(response.data);
@@ -69,6 +95,17 @@ export const ragApi = {
   async search(payload: RagSearchRequest): Promise<RagSearchResponse> {
     const response = await apiClient.post<Record<string, unknown>>('/api/v1/rag/search', toSearchPayload(payload));
     return toCamelCase<RagSearchResponse>(response.data);
+  },
+
+  async rebuildEmbeddings(
+    payload: RagEmbeddingRebuildRequest = {},
+  ): Promise<RagEmbeddingRebuildResponse> {
+    const response = await apiClient.post<Record<string, unknown>>(
+      '/api/v1/rag/embeddings/rebuild',
+      toEmbeddingRebuildPayload(payload),
+      { timeout: 120000 },
+    );
+    return toCamelCase<RagEmbeddingRebuildResponse>(response.data);
   },
 
   async getStats(): Promise<RagStatsResponse> {

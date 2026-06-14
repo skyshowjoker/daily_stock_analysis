@@ -17,6 +17,11 @@ export interface RagDocumentCreateResponse {
   title: string;
   chunkCount: number;
   duplicate: boolean;
+  summary: string;
+  sourceType: RagSourceType | string;
+  tags: string[];
+  enrichmentMethod: string;
+  parser: string;
 }
 
 export interface RagDocumentItem {
@@ -27,6 +32,7 @@ export interface RagDocumentItem {
   author: string;
   publishedAt?: string | null;
   tags: string[];
+  summary: string;
   metadata: Record<string, unknown>;
   contentHash: string;
   status: string;
@@ -80,6 +86,7 @@ export interface RagSearchResultItem {
   content: string;
   score: number;
   retrieval: string;
+  scoreComponents: Record<string, number>;
   createdAt?: string | null;
 }
 
@@ -97,6 +104,27 @@ export interface RagStatsResponse {
   chunkOverlap: number;
   retrievalMode: string;
   bySourceType: Record<string, number>;
+  supportedExtensions: string[];
+  maxUploadMb: number;
+  autoEnrichment: boolean;
+  semanticEnabled: boolean;
+  embeddingModel: string;
+  embeddedChunkCount: number;
+  embeddingCoveragePct: number;
+}
+
+export interface RagEmbeddingRebuildRequest {
+  documentId?: number;
+  force?: boolean;
+}
+
+export interface RagEmbeddingRebuildResponse {
+  enabled: boolean;
+  embeddingModel: string;
+  updatedChunks: number;
+  skippedChunks: number;
+  failedChunks: number;
+  error: string;
 }
 
 export interface RagDeleteResponse {

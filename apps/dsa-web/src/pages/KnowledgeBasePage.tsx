@@ -1,7 +1,16 @@
 import type React from 'react';
-import type { FormEvent } from 'react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { BookOpen, Database, RefreshCw, Search, Trash2, UploadCloud } from 'lucide-react';
+import type { DragEvent, FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  BookOpen,
+  BrainCircuit,
+  Database,
+  FileText,
+  RefreshCw,
+  Search,
+  Trash2,
+  UploadCloud,
+} from 'lucide-react';
 import { ragApi } from '../api/rag';
 import type { ParsedApiError } from '../api/error';
 import { getParsedApiError } from '../api/error';
@@ -19,7 +28,13 @@ import {
   Select,
   StatCard,
 } from '../components/common';
-import type { RagDocumentItem, RagSearchResultItem, RagSourceType, RagStatsResponse } from '../types/rag';
+import type {
+  RagDocumentCreateResponse,
+  RagDocumentItem,
+  RagSearchResultItem,
+  RagSourceType,
+  RagStatsResponse,
+} from '../types/rag';
 import { formatDateTime } from '../utils/format';
 
 const PAGE_SIZE = 20;
@@ -63,26 +78,30 @@ function formatScore(value: number): string {
   return value.toFixed(3);
 }
 
+type UploadQueueItem = {
+  id: string;
+  name: string;
+  status: 'pending' | 'uploading' | 'success' | 'error';
+  result?: RagDocumentCreateResponse;
+  error?: string;
+};
+
 const KnowledgeBasePage: React.FC = () => {
   useEffect(() => {
     document.title = '投资知识库 - DSA';
   }, []);
 
-  const [title, setTitle] = useState('');
-  const [sourceType, setSourceType] = useState<RagSourceType>('article');
-  const [sourceUri, setSourceUri] = useState('');
-  const [author, setAuthor] = useState('');
-  const [publishedAt, setPublishedAt] = useState('');
-  const [tagInput, setTagInput] = useState('投资框架');
-  const [content, setContent] = useState('');
-  const [replaceExisting, setReplaceExisting] = useState(false);
-  const [ingestLoading, setIngestLoading] = useState(false);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
+  const [uploadLoading, setUploadLoading] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const [uploadQueue, setUploadQueue] = useState<UploadQueueItem[]>([]);
   const [ingestError, setIngestError] = useState<ParsedApiError | null>(null);
-  const [ingestMessage, setIngestMessage] = useState<string | null>(null);
 
   const [stats, setStats] = useState<RagStatsResponse | null>(null);
   const [statsLoading, setStatsLoading] = useState(false);
   const [statsError, setStatsError] = useState<ParsedApiError | null>(null);
+  const [embeddingLoading, setEmbeddingLoading] = useState(false);
+  const [embeddingMessage, setEmbeddingMessage] = useState('');
 
   const [documents, setDocuments] = useState<RagDocumentItem[]>([]);
   const [documentsTotal, setDocumentsTotal] = useState(0);
@@ -103,7 +122,6 @@ const KnowledgeBasePage: React.FC = () => {
   const [searchRan, setSearchRan] = useState(false);
 
   const totalPages = Math.max(1, Math.ceil(documentsTotal / PAGE_SIZE));
-  const parsedTags = useMemo(() => parseTags(tagInput), [tagInput]);
 
   const loadStats = useCallback(async () => {
     setStatsLoading(true);
@@ -149,47 +167,82 @@ const KnowledgeBasePage: React.FC = () => {
     await Promise.all([loadStats(), loadDocuments()]);
   };
 
-  const handleIngest = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const trimmedTitle = title.trim();
-    const trimmedContent = content.trim();
-    if (!trimmedTitle || !trimmedContent) {
+  const handleRebuildEmbeddings = async () => {
+    if (!stats?.semanticEnabled || embeddingLoading) return;
+    setEmbeddingLoading(true);
+    setEmbeddingMessage('');
+    setStatsError(null);
+    try {
+      const response = await ragApi.rebuildEmbeddings();
+      if (response.failedChunks > 0) {
+        setEmbeddingMessage(
+          `已更新 ${response.updatedChunks} 个 chunk，${response.failedChunks} 个失败：${response.error || '请检查 embedding 服务配置'}`,
+        );
+      } else {
+        setEmbeddingMessage(
+          `语义索引已更新：新增 ${response.updatedChunks} 个，跳过 ${response.skippedChunks} 个。`,
+        );
+      }
+      await loadStats();
+    } catch (error) {
+      setStatsError(getParsedApiError(error));
+    } finally {
+      setEmbeddingLoading(false);
+    }
+  };
+
+  const handleFiles = async (files: File[]) => {
+    if (!files.length || uploadLoading) return;
+    const accepted = files.filter((file) => file.size > 0);
+    if (!accepted.length) {
       setIngestError({
-        title: '投喂内容不完整',
-        message: '标题和正文都是必填项。',
-        rawMessage: 'title and content are required',
+        title: '没有可上传的文档',
+        message: '请选择非空的 PDF、Word 或文本文件。',
+        rawMessage: 'no non-empty files selected',
         category: 'missing_params',
       });
       return;
     }
 
-    setIngestLoading(true);
+    const queueItems = accepted.map((file, index) => ({
+      id: `${file.name}-${file.size}-${file.lastModified}-${index}`,
+      name: file.name,
+      status: 'pending' as const,
+    }));
+    setUploadQueue(queueItems);
+    setUploadLoading(true);
     setIngestError(null);
-    setIngestMessage(null);
-    try {
-      const response = await ragApi.createDocument({
-        title: trimmedTitle,
-        content: trimmedContent,
-        sourceType,
-        sourceUri: sourceUri.trim() || undefined,
-        author: author.trim() || undefined,
-        publishedAt: publishedAt || undefined,
-        tags: parsedTags,
-        metadata: { ingested_from: 'web' },
-        replaceExisting,
-      });
-      setIngestMessage(
-        response.duplicate
-          ? `已有相同正文，未重复入库：#${response.documentId}「${response.title}」`
-          : `已入库 #${response.documentId}「${response.title}」，生成 ${response.chunkCount} 个 chunk。`,
-      );
-      setDocumentsPage(1);
-      await Promise.all([loadStats(), loadDocuments()]);
-    } catch (error) {
-      setIngestError(getParsedApiError(error));
-    } finally {
-      setIngestLoading(false);
+
+    for (let index = 0; index < accepted.length; index += 1) {
+      const file = accepted[index];
+      const itemId = queueItems[index].id;
+      setUploadQueue((items) => items.map((item) => (
+        item.id === itemId ? { ...item, status: 'uploading' } : item
+      )));
+      try {
+        const result = await ragApi.uploadDocument(file);
+        setUploadQueue((items) => items.map((item) => (
+          item.id === itemId ? { ...item, status: 'success', result } : item
+        )));
+      } catch (error) {
+        const parsedError = getParsedApiError(error);
+        setUploadQueue((items) => items.map((item) => (
+          item.id === itemId
+            ? { ...item, status: 'error', error: parsedError.message }
+            : item
+        )));
+      }
     }
+
+    setUploadLoading(false);
+    setDocumentsPage(1);
+    await Promise.all([loadStats(), loadDocuments()]);
+  };
+
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setIsDragging(false);
+    void handleFiles(Array.from(event.dataTransfer.files));
   };
 
   const handleApplyDocumentFilters = () => {
@@ -251,22 +304,41 @@ const KnowledgeBasePage: React.FC = () => {
       <PageHeader
         eyebrow="Investment RAG"
         title="投资知识库"
-        description="沉淀投资文章、新闻、书籍摘录和个人偏好；投喂后自动去重、分块、建立本地检索索引，并向 Agent 暴露可追溯的知识召回工具。"
+        description="上传投资文章、新闻、研究报告和书籍文档；系统自动解析正文、生成摘要、识别分类与标签，并建立可追溯的本地检索索引。"
         actions={(
-          <Button variant="secondary" onClick={() => void refreshAll()}>
-            <RefreshCw className="h-4 w-4" />
-            刷新
-          </Button>
+          <>
+            <Button
+              variant="secondary"
+              disabled={!stats?.semanticEnabled || (stats?.chunkCount ?? 0) === 0}
+              isLoading={embeddingLoading}
+              loadingText="构建中..."
+              onClick={() => void handleRebuildEmbeddings()}
+            >
+              <BrainCircuit className="h-4 w-4" />
+              更新语义索引
+            </Button>
+            <Button variant="secondary" onClick={() => void refreshAll()}>
+              <RefreshCw className="h-4 w-4" />
+              刷新
+            </Button>
+          </>
         )}
       />
 
       <InlineAlert
-        title="RAG 最佳实践默认策略"
-        message="当前入口只保存你明确提交的正文，来源 URL 仅用于溯源，不会自动抓网页。检索结果会保留 title、source、tag、chunk 和 score，方便你判断召回是否可信。"
+        title="只需上传文档"
+        message="无需填写标题、来源或标签。系统会从文件名和文档元数据识别标题，自动完成正文解析、摘要、分类、标签、去重和分块；原始文件不会长期保存。"
         variant="info"
       />
 
       {statsError ? <ApiErrorAlert error={statsError} onDismiss={() => setStatsError(null)} /> : null}
+      {embeddingMessage ? (
+        <InlineAlert
+          title="语义索引"
+          message={embeddingMessage}
+          variant={embeddingMessage.includes('失败') ? 'warning' : 'success'}
+        />
+      ) : null}
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <StatCard
           label="Documents"
@@ -290,102 +362,85 @@ const KnowledgeBasePage: React.FC = () => {
         />
         <StatCard
           label="Retrieval"
-          value="FTS5"
-          hint={stats?.retrievalMode ?? 'sqlite_fts5_bm25_lexical'}
+          value={stats?.semanticEnabled ? 'Hybrid' : 'FTS5'}
+          hint={stats?.semanticEnabled
+            ? `语义覆盖 ${stats.embeddingCoveragePct.toFixed(1)}% · ${stats.embeddingModel}`
+            : '未配置语义模型，使用 FTS5 + 词法检索'}
           tone="default"
+          icon={<BrainCircuit className="h-5 w-5" />}
         />
       </div>
 
       <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,420px)_minmax(0,1fr)]">
-        <Card title="投喂知识" subtitle="Ingest" className="xl:sticky xl:top-4">
+        <Card title="上传文档" subtitle="Upload" className="xl:sticky xl:top-4">
           {ingestError ? <ApiErrorAlert error={ingestError} onDismiss={() => setIngestError(null)} /> : null}
-          {ingestMessage ? (
-            <InlineAlert
-              title="投喂完成"
-              message={ingestMessage}
-              variant="success"
-              className="mb-4"
-              action={(
-                <button type="button" className="text-sm underline" onClick={() => setIngestMessage(null)}>
-                  关闭
-                </button>
-              )}
-            />
-          ) : null}
-          <form className="space-y-4" onSubmit={handleIngest}>
-            <Input
-              label="标题"
-              placeholder="如：巴菲特致股东信 2023 摘录"
-              value={title}
-              onChange={(event) => setTitle(event.target.value)}
-            />
-            <div className="grid gap-3 sm:grid-cols-2">
-              <Select
-                label="来源类型"
-                value={sourceType}
-                onChange={(value) => setSourceType(value as RagSourceType)}
-                options={INGEST_SOURCE_OPTIONS}
-              />
-              <Input
-                label="作者/来源"
-                placeholder="可选"
-                value={author}
-                onChange={(event) => setAuthor(event.target.value)}
-              />
+          <div
+            className={`flex min-h-[250px] flex-col items-center justify-center rounded-2xl border border-dashed p-6 text-center transition-colors ${
+              isDragging
+                ? 'border-primary bg-primary/10'
+                : 'border-border/70 bg-card/45 hover:border-primary/60 hover:bg-hover/45'
+            } ${uploadLoading ? 'cursor-wait opacity-70' : 'cursor-pointer'}`}
+            role="button"
+            tabIndex={0}
+            onClick={() => {
+              if (!uploadLoading) uploadInputRef.current?.click();
+            }}
+            onKeyDown={(event) => {
+              if (!uploadLoading && (event.key === 'Enter' || event.key === ' ')) {
+                uploadInputRef.current?.click();
+              }
+            }}
+            onDragOver={(event) => {
+              event.preventDefault();
+              if (!uploadLoading) setIsDragging(true);
+            }}
+            onDragLeave={(event) => {
+              event.preventDefault();
+              setIsDragging(false);
+            }}
+            onDrop={handleDrop}
+          >
+            <div className="rounded-2xl bg-primary/10 p-4 text-primary">
+              <UploadCloud className="h-8 w-8" />
             </div>
-            <Input
-              label="来源 URL / 书籍定位"
-              hint="仅作溯源，不会自动抓取网页正文。"
-              placeholder="https://... 或 book://..."
-              value={sourceUri}
-              onChange={(event) => setSourceUri(event.target.value)}
+            <h3 className="mt-4 text-base font-semibold text-foreground">拖拽文档到这里</h3>
+            <p className="mt-2 text-sm leading-6 text-secondary-text">
+              或点击选择一个或多个文件，选择后自动开始解析和入库。
+            </p>
+            <p className="mt-3 text-xs leading-5 text-muted-text">
+              {(stats?.supportedExtensions?.length
+                ? stats.supportedExtensions
+                : ['.pdf', '.doc', '.docx', '.txt', '.md', '.rtf', '.html', '.odt'])
+                .join(' / ')}
+              {' · '}
+              单文件不超过 {stats?.maxUploadMb ?? 20}MB
+            </p>
+            <input
+              ref={uploadInputRef}
+              type="file"
+              multiple
+              accept=".pdf,.doc,.docx,.txt,.md,.markdown,.rtf,.html,.htm,.odt"
+              className="hidden"
+              disabled={uploadLoading}
+              onChange={(event) => {
+                void handleFiles(Array.from(event.target.files ?? []));
+                event.target.value = '';
+              }}
             />
-            <div className="grid gap-3 sm:grid-cols-2">
-              <Input
-                label="发布日期"
-                type="date"
-                value={publishedAt}
-                onChange={(event) => setPublishedAt(event.target.value)}
-              />
-              <Input
-                label="标签"
-                hint={`已识别 ${parsedTags.length} 个标签`}
-                placeholder="价值投资, 风险, 偏好"
-                value={tagInput}
-                onChange={(event) => setTagInput(event.target.value)}
-              />
+          </div>
+
+          {uploadQueue.length > 0 ? (
+            <div className="mt-4 space-y-3">
+              {uploadQueue.map((item) => (
+                <UploadResultCard key={item.id} item={item} />
+              ))}
             </div>
-            <div>
-              <label htmlFor="rag-content" className="mb-2 block text-sm font-medium text-foreground">
-                正文
-              </label>
-              <textarea
-                id="rag-content"
-                className="input-surface input-focus-glow min-h-[260px] w-full resize-y rounded-xl border bg-transparent px-4 py-3 text-sm leading-6 text-foreground transition-all focus:outline-none"
-                placeholder="粘贴文章、新闻、书籍摘录，或写下你的投资偏好与约束..."
-                value={content}
-                onChange={(event) => setContent(event.target.value)}
-              />
-              <p className="mt-2 text-xs text-secondary-text">
-                {content.trim().length.toLocaleString()} 字符；上限 1,000,000 字符。
-              </p>
-            </div>
-            <label className="flex items-start gap-3 rounded-xl border border-border/55 bg-card/50 p-3 text-sm text-secondary-text">
-              <input
-                type="checkbox"
-                className="mt-1"
-                checked={replaceExisting}
-                onChange={(event) => setReplaceExisting(event.target.checked)}
-              />
-              <span>
-                如果正文哈希已存在，替换旧文档。默认会去重并返回已有文档，避免同一材料重复污染召回。
-              </span>
-            </label>
-            <Button type="submit" className="w-full" isLoading={ingestLoading} loadingText="正在入库...">
-              <UploadCloud className="h-4 w-4" />
-              投喂到知识库
-            </Button>
-          </form>
+          ) : (
+            <p className="mt-4 text-xs leading-5 text-secondary-text">
+              摘要与分类优先使用当前已配置的 AI 模型；语义模型配置后会为新文档自动建立向量索引。
+              任一模型不可用时仍可完成文档入库，并继续使用全文与词法检索。
+            </p>
+          )}
         </Card>
 
         <div className="space-y-5">
@@ -474,6 +529,9 @@ const KnowledgeBasePage: React.FC = () => {
                         {formatDateTime(document.createdAt)}
                         {document.sourceUri ? ` · ${document.sourceUri}` : ''}
                       </p>
+                      {document.summary ? (
+                        <p className="mt-3 text-sm leading-6 text-foreground/90">{document.summary}</p>
+                      ) : null}
                       {document.tags.length > 0 ? (
                         <div className="mt-3 flex flex-wrap gap-2">
                           {document.tags.map((tag) => <Badge key={tag} variant="history">#{tag}</Badge>)}
@@ -524,6 +582,69 @@ const KnowledgeBasePage: React.FC = () => {
         </div>
       </div>
     </AppPage>
+  );
+};
+
+const UploadResultCard: React.FC<{ item: UploadQueueItem }> = ({ item }) => {
+  const statusLabel = {
+    pending: '等待处理',
+    uploading: '解析与分类中',
+    success: item.result?.duplicate ? '已去重' : '已入库',
+    error: '处理失败',
+  }[item.status];
+  const statusVariant = item.status === 'error'
+    ? 'danger'
+    : item.status === 'success'
+      ? 'success'
+      : 'warning';
+
+  return (
+    <article className="rounded-2xl border border-border/60 bg-card/70 p-4 shadow-soft-card">
+      <div className="flex items-start gap-3">
+        <div className="rounded-xl bg-primary/10 p-2 text-primary">
+          <FileText className="h-5 w-5" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="truncate text-sm font-semibold text-foreground">{item.name}</h3>
+            <Badge variant={statusVariant}>{statusLabel}</Badge>
+          </div>
+          {item.status === 'uploading' ? (
+            <p className="mt-2 text-xs leading-5 text-secondary-text">
+              正在提取正文并自动生成摘要、分类和标签...
+            </p>
+          ) : null}
+          {item.error ? (
+            <p className="mt-2 text-sm leading-5 text-danger">{item.error}</p>
+          ) : null}
+          {item.result ? (
+            <>
+              <p className="mt-2 text-sm font-medium text-foreground">{item.result.title}</p>
+              {item.result.summary ? (
+                <p className="mt-2 text-xs leading-5 text-secondary-text">{item.result.summary}</p>
+              ) : null}
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Badge variant="info">
+                  {SOURCE_TYPE_LABEL[item.result.sourceType] ?? item.result.sourceType}
+                </Badge>
+                <Badge>{item.result.chunkCount} chunks</Badge>
+                {item.result.parser ? <Badge>{item.result.parser}</Badge> : null}
+                {item.result.enrichmentMethod ? (
+                  <Badge variant="history">
+                    {item.result.enrichmentMethod === 'llm' ? 'AI 富化' : '本地富化'}
+                  </Badge>
+                ) : null}
+              </div>
+              {item.result.tags.length > 0 ? (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {item.result.tags.map((tag) => <Badge key={tag} variant="history">#{tag}</Badge>)}
+                </div>
+              ) : null}
+            </>
+          ) : null}
+        </div>
+      </div>
+    </article>
   );
 };
 

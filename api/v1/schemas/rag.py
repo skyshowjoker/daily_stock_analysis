@@ -31,6 +31,7 @@ class RagDocumentItem(BaseModel):
     author: str = ""
     published_at: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
+    summary: str = ""
     metadata: Dict[str, Any] = Field(default_factory=dict)
     content_hash: str
     status: str
@@ -44,6 +45,11 @@ class RagDocumentCreateResponse(BaseModel):
     title: str
     chunk_count: int
     duplicate: bool = False
+    summary: str = ""
+    source_type: str = "other"
+    tags: List[str] = Field(default_factory=list)
+    enrichment_method: str = ""
+    parser: str = ""
 
 
 class RagDocumentListResponse(BaseModel):
@@ -84,6 +90,7 @@ class RagSearchResultItem(BaseModel):
     content: str
     score: float
     retrieval: str
+    score_components: Dict[str, float] = Field(default_factory=dict)
     created_at: Optional[str] = None
 
 
@@ -101,6 +108,27 @@ class RagStatsResponse(BaseModel):
     chunk_overlap: int
     retrieval_mode: str
     by_source_type: Dict[str, int] = Field(default_factory=dict)
+    supported_extensions: List[str] = Field(default_factory=list)
+    max_upload_mb: int = 20
+    auto_enrichment: bool = True
+    semantic_enabled: bool = False
+    embedding_model: str = ""
+    embedded_chunk_count: int = 0
+    embedding_coverage_pct: float = 0.0
+
+
+class RagEmbeddingRebuildRequest(BaseModel):
+    document_id: Optional[int] = Field(None, ge=1)
+    force: bool = False
+
+
+class RagEmbeddingRebuildResponse(BaseModel):
+    enabled: bool
+    embedding_model: str
+    updated_chunks: int
+    skipped_chunks: int
+    failed_chunks: int
+    error: str = ""
 
 
 class RagDeleteResponse(BaseModel):
